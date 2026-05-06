@@ -1225,27 +1225,47 @@ public class S3FileIOProperties implements Serializable {
    */
   public <T extends S3BaseClientBuilder<T, ?>> void applyMetricsPublisherConfiguration(T builder) {
     if (metricsPublisherImpl != null) {
-      builder.overrideConfiguration(c -> c.addMetricPublisher(loadMetricPublisher()));
+      ClientOverrideConfiguration.Builder configBuilder =
+          null != builder.overrideConfiguration()
+              ? builder.overrideConfiguration().toBuilder()
+              : ClientOverrideConfiguration.builder();
+      builder.overrideConfiguration(
+          configBuilder.addMetricPublisher(loadMetricPublisher()).build());
     }
   }
 
   private MetricPublisher loadMetricPublisher() {
+    // Phase 1: look up the factory. A NoSuchMethodException here means the class does not
+    // declare `create(Map)` — fall back to the no-arg constructor path. Any OTHER exception
+    // from a factory that DOES exist (e.g. the factory itself throws) should surface via the
+    // wrapping IllegalArgumentException in phase 2 so users can distinguish "wrong signature"
+    // from "misconfigured factory".
+    DynMethods.StaticMethod factory = null;
     try {
-      return (MetricPublisher)
+      factory =
           DynMethods.builder("create")
               .hiddenImpl(metricsPublisherImpl, Map.class)
-              .buildStaticChecked()
-              .invoke(allProperties);
+              .buildStaticChecked();
     } catch (NoSuchMethodException e) {
-      try {
-        return Class.forName(metricsPublisherImpl)
-            .asSubclass(MetricPublisher.class)
-            .getDeclaredConstructor()
-            .newInstance();
-      } catch (Exception ex) {
-        throw new IllegalArgumentException(
-            String.format("Cannot create MetricPublisher from class %s", metricsPublisherImpl), ex);
+      // Expected when the implementation doesn't provide a create(Map) factory — fall through.
+    }
+
+    // Phase 2: invoke whichever path we found. Exceptions here are real failures and are
+    // surfaced with the precise path that failed so the user can diagnose.
+    try {
+      if (factory != null) {
+        return (MetricPublisher) factory.invoke(allProperties);
       }
+      return Class.forName(metricsPublisherImpl)
+          .asSubclass(MetricPublisher.class)
+          .getDeclaredConstructor()
+          .newInstance();
+    } catch (Exception e) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Cannot create MetricPublisher from class %s via %s",
+              metricsPublisherImpl, factory != null ? "create(Map)" : "no-arg constructor"),
+          e);
     }
   }
 }
